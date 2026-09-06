@@ -2657,8 +2657,135 @@ text as glyph outlines, `rgb(%)` colours — for every graphics type. A test tha
 prints raw SVG can never match. Assert the meaning instead (`Area[Polygon[…]]`
 rather than counting `<polygon>` tags).
 
+Cairo also stamps per-run ids into the output, so even comparing wolframscript
+with *itself* fails:
+
+```sh
+wolframscript -code 'ExportString[Graphics[Line[{{0, 0}, {1, 1}}]], "SVG"] ===
+                     ExportString[Graphics[Line[{{0, 0}, {1, 1}}]], "SVG"]'
+# False
+```
+
+Two pictures that are the same drawing therefore cannot be compared through
+`ExportString` in a doc test either; pin those in
+`tests/interpreter_tests/graphics.rs` instead.
+
+### `Play` prints as `-Sound-`
+
+```sh
+wolframscript -code 'Play[Sin[2 Pi 440 t], {t, 0, 1}]'
+# Sound[SampledSoundFunction[CompiledFunction[{11, 15., 5446}, …], 8000, 8000]]
+woxi eval 'Play[Sin[2 Pi 440 t], {t, 0, 1}]'
+# -Sound-
+```
+
+wolframscript compiles the amplitude function and prints the whole compiled
+object, internal register layout and all. Woxi wraps the inert `Play` call in
+a `Sound`, which reports the same `Head` and renders the same playable widget,
+but prints as the short form. Test with `Head`, `AudioSampleRate` or
+`AudioLength`, never against the printed form.
+
+### `GraphPlot` accepts a `DirectedEdge`-keyed edge shape rule
+
+```sh
+wolframscript -code 'Head[GraphPlot[{1 -> 2, 2 -> 3},
+                       EdgeShapeFunction -> {DirectedEdge[1, 2] -> (Line[#1] &)}]]'
+# GraphPlot   (unevaluated, no message)
+woxi eval 'Head[GraphPlot[{1 -> 2, 2 -> 3},
+             EdgeShapeFunction -> {DirectedEdge[1, 2] -> (Line[#1] &)}]]'
+# Graphics
+```
+
+wolframscript's `GraphPlot` builds an *undirected* graph out of a rule list, so
+only an `UndirectedEdge`-keyed rule matches a part of it; a `DirectedEdge` key
+matches nothing and the whole call is abandoned without a message. Woxi accepts
+either key. Not reproduced: silently abandoning the plot looks like a defect,
+and the same call with an `UndirectedEdge` key conforms on both sides.
+
 
 ## Images
+
+### `HistogramTransform` equalizes on the bands, not on a spline
+
+Woxi maps each pixel to the midpoint of the band its value occupies in the
+cumulative distribution, rescaled from the 256 display levels to `k/255`. That
+reproduces wolframscript exactly whenever the distinct values are few or evenly
+spread — a four-value ramp, a two-value image, a constant channel, and the
+256-level identity all agree to the last bit — but wolframscript actually
+*interpolates* the cumulative distribution (its `Interpolation::inhr` message
+leaks out for a constant channel), so for other value distributions the two
+differ by up to about 3·10⁻³:
+
+```sh
+wolframscript -code 'ImageData[HistogramTransform[Image[{{0., 0.25, 0.5, 0.75, 1.}}]]]'
+# {{0.1, 0.301961, 0.501961, 0.701961, 0.901961}}
+woxi eval 'ImageData[HistogramTransform[Image[{{0., 0.25, 0.5, 0.75, 1.}}]]]'
+# {{0.0984314, 0.299216, 0.5, 0.700784, 0.901569}}
+```
+
+Reproducing the rest needs wolframscript's exact spline through its 256-bin
+histogram. Test rounded (`Round[100 …]`) or on the exact cases above.
+
+### `ColorBalance` matches the Bradford model to ~3·10⁻⁴
+
+Both engines run a von Kries adaptation in Bradford cone space over the same
+D50 working matrix, dividing away the *chromaticity* (XYZ normalized to
+`Y = 1`) of the reference. Woxi lands within about 3·10⁻⁴ of wolframscript,
+which is enough for `Round[100 …]` to agree everywhere but not for a bare
+`ImageData` comparison:
+
+```sh
+wolframscript -code 'ImageData[ColorBalance[Image[{{{0., 1., 0.}}}], Green]]'
+# {{{0.863451, 0.863391, 0.863085}}}
+woxi eval 'ImageData[ColorBalance[Image[{{{0., 1., 0.}}}], Green]]'
+# {{{0.863393, 0.863393, 0.863393}}}
+```
+
+wolframscript's answer is not even neutral — the three channels differ in the
+fourth decimal — so its matrix product is not the textbook one. Ruled out:
+D65 primaries (an order of magnitude worse), the rounded Bradford inverse, and
+CAT02/plain-von-Kries cone matrices.
+
+A *two*-channel image (gray plus alpha) diverges outright: Woxi balances the
+gray channel and drops the alpha, wolframscript mixes the two channels into
+something that is not the balance of either. Same family as the four-channel
+`ColorConvert` entry below — an unusual channel count with no colour space to
+go by.
+
+### `Pruning[image]` picks the other pixel of a final pair
+
+The counted form `Pruning[image, n]` conforms exactly. The bare form, which
+wears every thin arc down to a single pixel, agrees with wolframscript
+everywhere except which of the last two pixels is kept:
+
+```sh
+wolframscript -code 'ImageData[Pruning[Image[{{0, 0, 1, 0, 0}, {0, 0, 1, 0, 0},
+                                              {0, 0, 1, 0, 0}, {1, 1, 1, 1, 1}}]]]'
+# the surviving pixel is in the bottom row
+woxi eval '…'
+# the surviving pixel is one row up
+```
+
+Woxi keeps the first pixel in raster order of a component that a pass would
+empty. That matches wolframscript for horizontal, vertical and diagonal pairs
+alike in every other case tried, so the rule wolframscript really uses is
+something else again — it is not raster order, reverse raster order, or
+distance from the component's centroid.
+
+### `ColorConvert` of a four-channel image with no colour space
+
+```sh
+wolframscript -code 'ImageData[ColorConvert[Image[{{{1., 0., 0., 0.25}}}], "RGB"]]'
+# {{{1., 0., 0.25}}}
+woxi eval 'ImageData[ColorConvert[Image[{{{1., 0., 0., 0.25}}}], "RGB"]]'
+# {{{1., 0., 0.}}}
+```
+
+With `ImageColorSpace -> Automatic` and four channels, wolframscript builds its
+three output channels out of channels 1, 2 and **4** — it keeps the alpha and
+drops the blue. Given `ColorSpace -> "RGB"` explicitly it agrees with Woxi
+(alpha rides along untouched). Not reproduced: it looks like an off-by-one in
+wolframscript's channel handling, and the explicit spelling conforms.
 
 ### ImageAdd and friends refuse mismatched dimensions
 
@@ -3072,13 +3199,17 @@ blurred data either. Woxi leaves any non-zero scale unevaluated.
 
 ### `ExampleData` bundles its own data and properties
 
-Woxi ships the `"NetworkGraph"` datasets it assembled from the original
-sources rather than Wolfram's catalogue, and exposes the properties that data
-supports — `"VertexList"`, `"EdgeRules"`, `"AdjacencyMatrix"` — none of which
+Woxi lists Wolfram's whole 228-entry `"NetworkGraph"` catalogue (so
+`ExampleData["NetworkGraph"]` and `ExampleData::notent` agree), but ships the
+data for only the handful of classic networks it assembled from the original
+sources, and exposes the properties that data supports — `"VertexList"`, `"EdgeRules"`, `"AdjacencyMatrix"` — none of which
 wolframscript knows (it answers `ExampleData::notpropx`). Its own list is
 `ByteCount, Description, EdgeCount, EdgeProperty, FullGraph, Graph,
 LongDescription, Name, Source, StandardName, VertexCount, VertexProperty`.
-Deliberate: the catalogue is Wolfram's. Write tests against shape and
+`ExampleData[]` likewise names only the two collections Woxi serves, against
+wolframscript's nineteen, and the vertex *names* of a bundled network follow
+the original publication (`"MlleBaptistine"`) rather than Wolfram's spelling
+(`"Mlle Baptistine"`). Deliberate: the catalogue is Wolfram's. Write tests against shape and
 presence, never against either side's catalogue.
 
 ### `ExampleData[{"TestImage", name}]` ships no pixels
@@ -3194,6 +3325,23 @@ needs `Rc`/`Arc`-backed lists or a different allocator.
 The error goes to stderr but the exit code stays 0, so a shell check like
 `woxi eval '…' >/dev/null 2>&1 && echo OK` reports OK even when the expression
 failed. (`wolframscript -file` has the same property.)
+
+### `woxi repl` does not tag the output prompt with the result's form
+
+When a REPL line evaluates to an output-form wrapper, wolframscript moves the
+wrapper into the prompt and prints the wrapped expression:
+
+```text
+In[1]:= 7//FullForm
+Out[1]//FullForm= 7      (* wolframscript *)
+Out[1]= FullForm[7]      (* woxi repl     *)
+```
+
+Same for `MatrixForm`, `TableForm`, `InputForm` and the other form wrappers.
+`woxi eval` is unaffected — script mode prints `FullForm[7]` on both sides.
+The REPL gets only the formatted string back from `interpret`, so tagging the
+prompt needs the result expression (and a per-wrapper rendering) plumbed
+through to `repl.rs`.
 
 ### `balanced_ternary` computes a wrong value
 

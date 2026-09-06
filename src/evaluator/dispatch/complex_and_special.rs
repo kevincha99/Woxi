@@ -1918,16 +1918,22 @@ pub fn dispatch_complex_and_special(
       return Some(Ok(unevaluated(name, args)));
     }
 
-    // `In[k]` references prior input. With no input history (script mode),
-    // `In[-N]` resolves to `In[$Line - N]`, which clamps to `In[0]` for any
-    // non-positive index. Positive indices stay unevaluated as `In[k]`.
-    "In" if args.len() == 1 => {
-      if let Expr::Integer(k) = &args[0]
-        && *k <= 0
+    // `In[k]` re-evaluates the input entered on line k; `In[]` and `In[-N]`
+    // count back from the current line, i.e. `In[$Line - N]`. A line with
+    // no recorded input — every line in script mode, where no history is
+    // kept — stays unevaluated as `In[k]`, with the index clamped at 0.
+    "In" => {
+      let Some((_, index)) =
+        super::evaluation_control::history_line_index("In", args)
+      else {
+        return Some(Ok(unevaluated("In", args)));
+      };
+      if index > 0
+        && let Some((source, _guard)) = crate::begin_input_expansion(index)
       {
-        return Some(Ok(call1("In", Expr::Integer(0))));
+        return Some(crate::interpret_to_expr(&source));
       }
-      return Some(Ok(unevaluated("In", args)));
+      return Some(Ok(call1("In", Expr::Integer(index.max(0)))));
     }
 
     // SequenceForm[a, b, c, ...] prints the concatenated string forms of
@@ -8535,7 +8541,11 @@ fn simplex_edges(pts: &[Expr]) -> Option<Vec<Expr>> {
 
 /// `n!` as an `i128` for small `n`.
 fn factorial_small(n: usize) -> i128 {
-  (1..=n as i128).product::<i128>().max(1)
+  let mut r = 1i128;
+  for i in 2..=n {
+    r *= i as i128;
+  }
+  r
 }
 
 /// Decompose Parallelogram arguments into (base point, v1, v2), applying the
@@ -8898,7 +8908,7 @@ fn triangle_moment_parts(
     times(vec![d1[0].clone(), d2[1].clone()]),
     times(vec![int_e(-1), d1[1].clone(), d2[0].clone()]),
   ]))?;
-  let factorial = |m: i128| -> i128 { (1..=m).product::<i128>().max(1) };
+  let factorial = |m: i128| factorial_small(m as usize);
   let multinom = |m: i128, a: i128, b: i128| -> i128 {
     factorial(m) / (factorial(a) * factorial(b) * factorial(m - a - b))
   };
@@ -11884,10 +11894,7 @@ fn try_polynomial(vals: &[(i128, i128)], var_name: &str) -> Option<Expr> {
       terms.push(rational_to_expr(diffs[k].0, diffs[k].1));
     } else {
       // Compute coefficient: diffs[k] / k!
-      let mut factorial: i128 = 1;
-      for j in 1..=k as i128 {
-        factorial *= j;
-      }
+      let factorial = factorial_small(k);
       let coeff = rat_div(diffs[k], (factorial, 1))?;
 
       // Build product (n-1)(n-2)...(n-k) as a polynomial
